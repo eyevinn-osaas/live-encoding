@@ -18,12 +18,73 @@ import {
 import { existsSync } from 'fs';
 import { HLSPullPush, MediaPackageOutput } from '@eyevinn/hls-pull-push';
 import { PullPushLogger } from './utils/pull_push_logger';
+import { redactSecrets } from './utils/redact';
+
+// Re-exported for existing importers of encoder.ts.
+export { redactSecrets };
 
 // Default upper bound (seconds) on how long an SRT caller keeps re-dialing an
 // input source that is not up yet. Overridable per start request via the
 // EncoderStartRequest timeout field, or globally via the INPUT_DIAL_TIMEOUT env
 // var (wired in server.ts). Does not apply to the RTMP listener input.
 export const DEFAULT_INPUT_DIAL_TIMEOUT_SEC = 300;
+
+// RTMP listener probing budget. ffmpeg builds the input stream list from the
+// first packets of a publish. Some publishers (e.g. DJI Fly) are believed to
+// send audio well before the first video tag, so with the default ~5 s / 5 MB
+// probe ffmpeg can conclude the input is audio-only and every [0:v] reference
+// then fails with 'matches no streams'. Probing stops as soon as both tracks
+// are seen, so publishers that send video promptly (OBS) are not slowed down.
+export const RTMP_LISTEN_PROBESIZE = 50_000_000; // bytes
+export const RTMP_LISTEN_ANALYZEDURATION_US = 20_000_000; // microseconds
+
+// RTMP listener crash-loop guard. In listen mode an unexpected ffmpeg exit
+// (failed publish, publisher disconnect, stray non-RTMP connection) re-listens
+// instead of ending the run. An exit within LISTEN_FAST_EXIT_WINDOW_MS of the
+// spawn counts as a fast exit; LISTEN_MAX_FAST_EXITS of them in a row (with no
+// 'running' in between) lands in 'error' so a hard failure (e.g. port already
+// bound, bad args) does not respawn forever.
+export const LISTEN_FAST_EXIT_WINDOW_MS = 30_000;
+export const LISTEN_MAX_FAST_EXITS = 10;
+
+// Route one line of ffmpeg stderr to the matching log level. Listen mode runs
+// ffmpeg with '-loglevel level+info', which prefixes every message with its
+// level ('[rtmp @ 0x..] [error] ...'), so routine output (banner, Input #0
+// track list, HLS 'Opening ... for writing') is not logged as an error.
+// Unprefixed lines (caller mode runs with plain '-loglevel error', so its
+// stderr is errors only) keep the historical error level. Info-level ffmpeg
+// output is logged at info until the encoder is running, so probing
+// diagnostics are visible, and at debug afterwards so per-segment chatter does
+// not flood operator logs.
+const FFMPEG_LEVEL_PREFIX =
+  /^(?:\[[^\]]*\]\s*)*?\[(trace|debug|verbose|info|warning|error|fatal|panic)\]/;
+
+export function ffmpegLogLevel(
+  line: string,
+  running: boolean
+): 'error' | 'warn' | 'info' | 'debug' {
+  // ffmpeg's repeat-suppression notice carries no level prefix; it only
+  // annotates the previous line, which has already been logged.
+  if (/^\s*Last message repeated \d+ times?/.test(line)) {
+    return 'debug';
+  }
+  const match = FFMPEG_LEVEL_PREFIX.exec(line);
+  if (!match) {
+    return 'error';
+  }
+  switch (match[1]) {
+    case 'panic':
+    case 'fatal':
+    case 'error':
+      return 'error';
+    case 'warning':
+      return 'warn';
+    case 'info':
+      return running ? 'debug' : 'info';
+    default:
+      return 'debug';
+  }
+}
 
 // HLS subtitle rendition group id used in the master playlist.
 const SUBTITLE_GROUP_ID = 'subs';
@@ -32,15 +93,6 @@ const SUBTITLE_GROUP_ID = 'subs';
 // -rw_timeout). Without it a stalled subtitle server would pin the encoder in
 // 'starting' forever with no output once the input source connects.
 const SUBTITLE_RW_TIMEOUT_US = 15_000_000;
-
-// Redact secrets that may appear in a value that is logged or placed into an
-// error message: basic-auth userinfo embedded in a URL (user:pass@host) and URL
-// query strings (which may carry a passphrase or a signed-URL token).
-export function redactSecrets(value: string): string {
-  return value
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]*@/gi, '$1<redacted>@')
-    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s?]*)\?[^\s]*/gi, '$1?<redacted>');
-}
 
 export type BitrateLadderStep = {
   mediaType: 'video' | 'audio';
@@ -212,6 +264,8 @@ export type EncoderOpts = {
 type Process = {
   exitCode: number;
   process?: ChildProcess;
+  spawnedAt: number;
+  exitedAt?: number;
 };
 
 export class Encoder {
@@ -220,6 +274,8 @@ export class Encoder {
   private pullPushStarted = false;
   private subtitleMasterFinalized = false;
   private subtitleFinalizeAttempts = 0;
+  // Consecutive fast ffmpeg exits in RTMP listen mode (crash-loop guard).
+  private listenFastExits = 0;
   private ffmpeg?: Process;
   private pullPush?: HLSPullPush;
   private fetcherId?: string;
@@ -237,7 +293,12 @@ export class Encoder {
         this.opts.outputUrl.protocol == 'https:' ||
         this.opts.outputUrl.protocol == 'http:'
       ) {
-        this.pullPush = new HLSPullPush(new PullPushLogger());
+        this.pullPush = new HLSPullPush(
+          new PullPushLogger([
+            this.opts.outputUrl.username,
+            this.opts.outputUrl.password
+          ])
+        );
       } else {
         throw new Error(`Unsupported protocol ${this.opts.outputUrl.protocol}`);
       }
@@ -291,7 +352,12 @@ export class Encoder {
     const ffmpegArgs = inputArgs.concat(filterComplexArgs).concat(outputArgs);
 
     this.status = 'starting';
+    this.listenFastExits = 0;
     const startAttemptTs = Date.now();
+    // Start of the current wait for an RTMP publish, used by the listener
+    // start timeout. Reset when re-listening after a publisher disconnect so
+    // the timeout bounds each wait, not the age of the whole run.
+    let listenWaitStartTs = startAttemptTs;
     // Caller-mode input bounds the dial with a deadline: the per-request
     // timeout if supplied, otherwise a configured/default deadline. The RTMP
     // listener keeps its original behaviour (unbounded unless a timeout is set).
@@ -337,6 +403,48 @@ export class Encoder {
               await this.cleanup();
               await this.startFFmpeg(ffmpegArgs);
             }
+          } else if (!this.opts.inputUrl) {
+            // RTMP listen mode: a failed publish, a publisher disconnect or a
+            // stray non-RTMP connection (exit 251) ends the ffmpeg process,
+            // but the encoder must go back to listening rather than leave
+            // nothing bound to the RTMP port until the next start request.
+            const uptimeMs =
+              (this.ffmpeg.exitedAt ?? Date.now()) - this.ffmpeg.spawnedAt;
+            if (uptimeMs < LISTEN_FAST_EXIT_WINDOW_MS) {
+              this.listenFastExits++;
+            } else {
+              this.listenFastExits = 0;
+            }
+            if (this.listenFastExits >= LISTEN_MAX_FAST_EXITS) {
+              Log().error(
+                `ffmpeg exited ${this.listenFastExits} times in a row within ` +
+                  `${LISTEN_FAST_EXIT_WINDOW_MS / 1000} s of listening ` +
+                  `(last exit code ${this.ffmpeg.exitCode}), giving up`
+              );
+              await this.stopPullPush();
+              this.status = 'error';
+              clearInterval(monitor);
+            } else {
+              Log().info(
+                'ffmpeg process unintentionally exited with code ' +
+                  this.ffmpeg.exitCode +
+                  ', listening for a new RTMP publish'
+              );
+              if (this.status === 'running') {
+                listenWaitStartTs = Date.now();
+              }
+              this.status = 'starting';
+              // cleanup() deletes /hls, which would make the pull-push
+              // fetcher end the downstream output (ENDLIST) and then replay
+              // stale state against the restarted media sequence. Stop it so
+              // the next transition to 'running' starts a fresh fetcher.
+              await this.stopPullPush();
+              await this.cleanup();
+              // stop() may have been requested while cleanup was pending.
+              if (!this.wantsToStop) {
+                await this.startFFmpeg(ffmpegArgs);
+              }
+            }
           } else {
             Log().info(
               'ffmpeg process unintentionally exited with code ' +
@@ -361,6 +469,7 @@ export class Encoder {
                 'We have HLS index file available, change status to running'
               );
               this.status = 'running';
+              this.listenFastExits = 0;
               if (this.opts.outputUrl && !this.pullPushStarted) {
                 await this.startPullPush();
               }
@@ -380,7 +489,7 @@ export class Encoder {
           } else if (startRequest.timeout) {
             if (
               this.status != 'running' &&
-              Date.now() - startAttemptTs > startRequest.timeout * 1000
+              Date.now() - listenWaitStartTs > startRequest.timeout * 1000
             ) {
               Log().info('Timeout reached');
               await this.stop();
@@ -396,7 +505,11 @@ export class Encoder {
     return {
       rtmpPort: this.rtmpPort,
       streamKey: this.streamKey,
-      outputUrl: this.opts.outputUrl?.toString(),
+      // Echoed in the POST /api/encoder response: strip basic-auth userinfo
+      // and query secrets so OUTPUT_URL credentials never leave the process.
+      outputUrl: this.opts.outputUrl
+        ? redactSecrets(this.opts.outputUrl.toString())
+        : undefined,
       playlist: '/origin/hls/index.m3u8',
       status: this.status
     };
@@ -491,7 +604,8 @@ export class Encoder {
     this.wantsToStop = false;
     this.ffmpeg = {
       exitCode: 0,
-      process: spawn(this.ffmpegExecutable, ffmpegArgs)
+      process: spawn(this.ffmpegExecutable, ffmpegArgs),
+      spawnedAt: Date.now()
     };
     this.ffmpeg.process?.stderr?.on('data', (data) => {
       // Redact URL query strings: a failed srt dial echoes the full input URL
@@ -499,7 +613,13 @@ export class Encoder {
       // failed dials are the common path. Note stderr data events are chunked,
       // so a URL split across chunks could theoretically evade redaction; this
       // covers the normal single-line case.
-      Log().error(redactSecrets(`${data}`));
+      const running = this.status === 'running';
+      for (const line of `${data}`.split(/\r?\n/)) {
+        if (line.trim() === '') {
+          continue;
+        }
+        Log()[ffmpegLogLevel(line, running)](redactSecrets(line));
+      }
     });
     this.ffmpeg.process?.on('exit', (code) => {
       Log().info('ffmpeg exited with code ' + code);
@@ -507,6 +627,7 @@ export class Encoder {
       Log().info(`  wantsToStop: ${this.wantsToStop}`);
       if (this.ffmpeg) {
         this.ffmpeg.process = undefined;
+        this.ffmpeg.exitedAt = Date.now();
         this.ffmpeg.exitCode = code || (this.wantsToStop ? 0 : 1);
       }
     });
@@ -740,12 +861,21 @@ export function generateInput(
   // the given source (e.g. an srt:// URL). Any protocol knobs (latency,
   // passphrase, streamid, connect timeout, ...) travel as query parameters on
   // the URL and are parsed by ffmpeg itself, so no option strings are hardcoded.
+  //
+  // The RTMP listener logs at info (with level prefixes, see ffmpegLogLevel)
+  // so the Input #0 track list of every publish is visible, and probes longer
+  // so late-arriving video is still detected (see RTMP_LISTEN_PROBESIZE).
   const args = inputUrl
     ? ['-y', '-loglevel', 'error', '-i', inputUrl]
     : [
         '-y',
         '-loglevel',
-        'error',
+        'level+info',
+        '-nostats',
+        '-probesize',
+        `${RTMP_LISTEN_PROBESIZE}`,
+        '-analyzeduration',
+        `${RTMP_LISTEN_ANALYZEDURATION_US}`,
         '-listen',
         '1',
         '-i',
